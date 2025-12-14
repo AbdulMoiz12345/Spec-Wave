@@ -304,3 +304,172 @@ class UNetDiT_SR(nn.Module):
         x, _ = self.stage1_up(x, t_emb)
 
         return self.out_proj(x)
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from tqdm import tqdm
+# ===========================================================
+# 1. Configuration
+# ===========================================================
+# Paths
+DATA_DIR = "/sr_data2/dit_sr_f4_multispectral"
+TRAIN_LR_FILE = os.path.join(DATA_DIR, "train_LR_multispectral.npy")
+TRAIN_HR_LAT_FILE = os.path.join(DATA_DIR, "train_HR_latents_2.npy")
+
+# Training Hyperparameters
+BATCH_SIZE = 32
+LEARNING_RATE = 5e-5         
+EPOCHS = 100                 # GDFN converges faster than MLP, but 100 is safe
+NOISE_STEPS = 15             # ResShift steps
+KAPPA = 2.0                  # ResShift Noise Variance
+
+# RGB Indices for Sentinel-2 (Usually B4, B3, B2) to create the 3-channel residue
+RGB_INDICES = [3, 2, 1] 
+
+# ===========================================================
+# 2. Wavelet Loss Function
+# ===========================================================
+def wavelet_loss(pred, target):
+    """
+    Calculates loss in the Wavelet Domain.
+    Forces the model to learn structure (LL) and sharp textures (HF) separately.
+    """
+    # 1. Decompose -> [LL, HL, LH, HH]
+    # Input: (B, 3, 24, 24) -> Output: (B, 12, 12, 12)
+    pred_dwt = haar_dwt(pred)
+    target_dwt = haar_dwt(target)
+    
+    # 2. Split Bands
+    # First 3 channels are LL (Low Freq), rest are High Freq
+    C = 3 
+    
+    pred_LL = pred_dwt[:, :C, :, :]
+    target_LL = target_dwt[:, :C, :, :]
+    
+    pred_HF = pred_dwt[:, C:, :, :]
+    target_HF = target_dwt[:, C:, :, :]
+    
+    # 3. Calculate Loss
+    # Structure (LL) -> MSE (Smoothness)
+    loss_structure = F.mse_loss(pred_LL, target_LL)
+    
+    # Texture (HF) -> L1 (Sparsity/Sharpness)
+    loss_texture = F.l1_loss(pred_HF, target_HF)
+    
+    # Weight texture higher to improve LPIPS
+    return loss_structure + 2.0 * loss_texture
+
+# ===========================================================
+# 3. Dataset & Scheduler
+# ===========================================================
+class SRLatentDataset(Dataset):
+    def __init__(self, lr_path, hr_lat_path):
+        print(f"Loading data from {lr_path}...")
+        self.lr = np.load(lr_path)       
+        self.hr_lat = np.load(hr_lat_path) 
+        self.n = len(self.lr)
+        print(f"Loaded {self.n} samples.")
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, idx):
+        return torch.from_numpy(self.lr[idx]), torch.from_numpy(self.hr_lat[idx])
+
+class ResShiftScheduler:
+    def __init__(self, num_steps=15):
+        self.num_steps = num_steps
+        self.timesteps = torch.arange(1, num_steps + 1).float()
+        self.etas = self.timesteps / num_steps
+
+    def get_eta(self, t_idx):
+        return self.etas[t_idx]
+
+# ===========================================================
+# 4. Training Loop
+# ===========================================================
+def train():
+    # 1. Setup Data
+    if not os.path.exists(TRAIN_LR_FILE):
+        print(f"ERROR: Data file {TRAIN_LR_FILE} not found.")
+        return
+
+    train_ds = SRLatentDataset(TRAIN_LR_FILE, TRAIN_HR_LAT_FILE)
+    loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    
+    # 2. Setup Model (GDFN + ChannelAttn + AdaWM)
+    model = UNetDiT_SR().to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    
+    # Calculate params (Should be slightly higher due to GDFN/CAB)
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model Parameters (GDFN-SpecWave): {param_count/1e6:.2f}M")
+
+    # 3. Scheduler
+    scheduler = ResShiftScheduler(num_steps=NOISE_STEPS)
+
+    print(f"Starting Training on {DEVICE}...")
+
+    for epoch in range(EPOCHS):
+        model.train()
+        pbar = tqdm(loader)
+        loss_ema = None
+        
+        for lr, hr_lat in pbar:
+            # Inputs
+            lr, hr_lat = lr.to(DEVICE), hr_lat.to(DEVICE)
+            B = lr.shape[0]
+            
+            # -----------------------------------------------------------
+            # ResShift Setup
+            # -----------------------------------------------------------
+            # 1. Extract RGB from LR for the "Start Point" y0
+            # lr is (B, 12, 24, 24), lr_rgb is (B, 3, 24, 24)
+            lr_rgb = lr[:, RGB_INDICES, :, :]
+            
+            # 2. Sample Time
+            t_idx = torch.randint(0, NOISE_STEPS, (B,), device=DEVICE)
+            eta_t = scheduler.get_eta(t_idx.cpu()).to(DEVICE).view(B, 1, 1, 1)
+            
+            # 3. Create Noisy State xt
+            residual = lr_rgb - hr_lat
+            noise = torch.randn_like(hr_lat)
+            std_dev = KAPPA * torch.sqrt(eta_t)
+            
+            xt = hr_lat + eta_t * residual + std_dev * noise
+            
+            # -----------------------------------------------------------
+            # Optimization
+            # -----------------------------------------------------------
+            # 4. Predict
+            # Model takes FULL 12-channel LR (via SpectralEncoder)
+            pred_x0 = model(lr, xt, t_idx)
+            
+            # 5. Loss (Using Wavelet Loss)
+            loss = wavelet_loss(pred_x0, hr_lat)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Clip Grads (GDFN can be sensitive to exploding grads initially)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            
+            optimizer.step()
+            
+            # Logging
+            if loss_ema is None: loss_ema = loss.item()
+            else: loss_ema = 0.95 * loss_ema + 0.05 * loss.item()
+            
+            pbar.set_description(f"Ep {epoch+1}/{EPOCHS} | Loss: {loss_ema:.4f}")
+
+        # Checkpointing
+        if (epoch + 1) % 5 == 0:
+            save_path = f"dit_sr_gdfn_epoch_{epoch+1}.pt"
+            torch.save(model.state_dict(), save_path)
+            print(f"Saved checkpoint: {save_path}")
+
+if __name__ == "__main__":
+    train()
